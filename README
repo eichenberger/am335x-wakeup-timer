@@ -1,0 +1,22 @@
+Wakeup with a DMTIMER on am335x boards
+
+This driver should add additonal support for wakeup from dmtimer on am335x based boards. This can be useful if the RTC on the chip is not powered/enabled and therefore it is not possible to have a timer based wakeup source from standby.
+
+Only tested with kernel 4.4.71 with patches from ti SDK. The mainline kernel does not support standby for am335x at the moment.
+
+Add the following entry to the devicetree file. Only standby (Deepsleep 1) is supported for now, Deepsleep 0 does not work, because dmtimer0 and dmtimer1 are already used internally.
+
+wakeup_timer0: wakeup_timer@0 {
+	status = "okay";
+	compatible = "wakeup-timer";
+	timer = <&timer3>;
+	interrupts = <68>;	 // To be verified
+	interrupt-names	= "wakeup";	// To be verified
+	wakeup-source;	// To be verified
+};
+
+&timer3 {
+		status = "okay";
+		wakeup-source;	// To be verified
+		ti,no-idle;
+};
