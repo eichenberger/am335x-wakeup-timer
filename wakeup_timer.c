@@ -6,6 +6,7 @@
 #include <linux/pm_wakeup.h>
 #include <linux/clk.h>
 #include <linux/interrupt.h>
+#include <linux/timekeeping.h>
 
 
 #include "dmtimer.h"
@@ -15,6 +16,8 @@ struct wakeup_timer_priv {
 	int freq_hz;
 	int irq;
 	u32 sleep_time_ms;
+	u32 load_register;
+	struct timespec64 suspend_time;
 
 	struct platform_device *pdev;
 };
@@ -30,6 +33,7 @@ static irqreturn_t omap_gpio_irq_handler(int irq, void *data)
 	omap_dm_timer_set_int_disable(timer, 2);
 
 	pm_wakeup_event(&priv->pdev->dev, 0);
+
 	return IRQ_HANDLED;
 }
 
@@ -41,8 +45,8 @@ static int start_timer(struct wakeup_timer_priv *priv)
 	u32 sleep_clocks;
 	u32 load;
 
-	/* We only have 32 bits and we have to multiply with up to 20000 Hz therefore
-	 * we need to round to seconds first if we have times > 40s.
+	/* We only have 32 bits and we have to multiply with up to 20000 Hz
+	 * therefore we need to round to seconds first if we have times > 40s.
 	 * 40000 * 100000 = 4000000000 which still fits in 32 bits */
 	if (sleep_time_ms > 40090) {
 		sleep_clocks = (sleep_time_ms/1000) * freq_hz;
@@ -53,11 +57,13 @@ static int start_timer(struct wakeup_timer_priv *priv)
 	}
 
 	if (sleep_clocks > 0xFFFFFFFF) {
-		printk(KERN_ERR "Can not start timer because sleep clocks (0x%016X) overflows 32bit\n", load);
+		printk(KERN_ERR "Sleep clocks (0x%016X) overflows 32bit\n", load);
 		return -EINVAL;
 	}
 
 	load = 0xFFFFFFFF - sleep_clocks;
+
+	priv->load_register = load;
 
 	omap_dm_timer_set_int_enable(timer, 2);
 
@@ -101,8 +107,8 @@ static ssize_t sleep_time_ms_show(struct device *dev,
 	return sprintf(buf, "%u\n", wakeup_timer->sleep_time_ms);
 }
 
-static ssize_t sleep_time_ms_store(struct device *dev, struct device_attribute *attr,
-			   const char *buf, size_t count)
+static ssize_t sleep_time_ms_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct wakeup_timer_priv *wakeup_timer = dev_get_drvdata(dev);
 	int ret;
@@ -141,19 +147,27 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 	struct omap_dm_timer *timer;
 	struct clk *timer_clk;
 	unsigned int rate;
-	struct device_node *node;
+	struct device_node *timer_np;
+	struct device_node *np;
 	int ret;
 
 	dev_info(&pdev->dev, "%s\n", __func__);
 
-	wakeup_timer = devm_kzalloc(&pdev->dev, sizeof(*wakeup_timer), GFP_KERNEL);
+	wakeup_timer = devm_kzalloc(&pdev->dev, sizeof(*wakeup_timer),
+						       GFP_KERNEL);
 	if (!wakeup_timer)
 		return -ENOMEM;
 
-	node = of_parse_phandle(pdev->dev.of_node, "timer", 0);
-	if (node != NULL) {
+	np = pdev->dev.of_node;
+	if (!np) {
+		dev_err(&pdev->dev, "No node for wakeup timer found\n");
+		return -EINVAL;
+	}
+
+	timer_np = of_parse_phandle(np, "timer", 0);
+	if (timer_np != NULL) {
 		dev_info(&pdev->dev, "Request timer by node\n");
-		timer = omap_dm_timer_request_by_node(node);
+		timer = omap_dm_timer_request_by_node(timer_np);
 		if (timer == NULL) {
 			return -EBUSY;
 		}
@@ -169,6 +183,7 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 	wakeup_timer->timer = timer;
 	wakeup_timer->pdev = pdev;
 	wakeup_timer->sleep_time_ms = 2000;
+	wakeup_timer->load_register= 0;
 
 	omap_dm_timer_set_source(timer, OMAP_TIMER_SRC_SYS_CLK);
 
@@ -187,14 +202,16 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 			wakeup_timer->freq_hz = 16393;
 			break;
 		default:
-			dev_err(&pdev->dev, "Rate of %d is not supported by this driver\n", rate);
+			dev_err(&pdev->dev,
+				"Rate of %d is not supported by this driver\n",
+				rate);
 			goto error;
 	}
 
 
 	wakeup_timer->irq = omap_dm_timer_get_irq(timer);
 	if (wakeup_timer->irq <= 0) {
-		dev_err(&pdev->dev, "Timer does not have any interrupt\n");
+		dev_err(&pdev->dev, "Timer does not have a valid irq\n");
 		goto error;
 	}
 
@@ -204,8 +221,9 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Could not enable wakeup source %d\n", ret);
 	}
 
-	ret = devm_request_irq(&pdev->dev, wakeup_timer->irq, omap_gpio_irq_handler,
-			       IRQF_NO_SUSPEND, "wakeup-timer", wakeup_timer);
+	ret = devm_request_irq(&pdev->dev, wakeup_timer->irq,
+			omap_gpio_irq_handler, IRQF_NO_SUSPEND, "wakeup-timer",
+			wakeup_timer);
 
 	ret = sysfs_create_groups(&pdev->dev.kobj, wakeup_timer_groups);
 	if (ret) {
@@ -247,17 +265,58 @@ static int __exit wakeup_timer_remove(struct platform_device *pdev)
 
 static int wakeup_timer_suspend(struct device *dev)
 {
-	struct wakeup_timer_priv *wakeup_timer = dev_get_drvdata(dev);
+	struct wakeup_timer_priv *priv = dev_get_drvdata(dev);
 
-	start_timer(wakeup_timer);
+	getnstimeofday64(&priv->suspend_time);
+	start_timer(priv);
 
 	return 0;
 }
 
+static inline void correct_time(struct device *dev,
+		const struct timespec64 *old_time)
+{
+	struct wakeup_timer_priv *priv = dev_get_drvdata(dev);
+	struct timespec64 diff_time, new_time;
+	unsigned int timer_diff, timer_counter;
+
+	timer_counter = omap_dm_timer_read_counter(priv->timer);
+	timer_diff = (timer_counter - 1) - priv->load_register;
+	diff_time.tv_sec = timer_diff/priv->freq_hz;
+	/* We only correct ms because we have to take care of 32 bit.
+	 * The formula would be: (diff % freq) * freq
+	 * which would give the time after comma in seconds. */
+	diff_time.tv_nsec = (((timer_diff % priv->freq_hz) * 1000) /
+			priv->freq_hz) * 1000000;
+
+	dev_info(dev, "correct time by: %llds and %ldns\n",
+			diff_time.tv_sec, diff_time.tv_nsec);
+
+	new_time = timespec64_add(*old_time, diff_time);
+
+	/* Now we update the system time with the updated value */
+	do_settimeofday64(&new_time);
+}
 
 static int wakeup_timer_resume(struct device *dev)
 {
-	dev_info(dev, "%s\n", __func__);
+	struct timespec64 old_time, diff_time;
+	struct wakeup_timer_priv *priv = dev_get_drvdata(dev);
+
+	/* Snapshot the current rtc and system time at resume.
+	 * This time was updated right before standby */
+	getnstimeofday64(&old_time);
+
+	/* Only correct if diff is < 2s, it could be that the time already
+	 * was correctd by someone else */
+	diff_time = timespec64_sub(old_time, priv->suspend_time);
+	if (diff_time.tv_sec > 2) {
+		dev_info(dev, "Don't correct time because div > 2s\n");
+		return 0;
+	}
+
+	correct_time(dev, &old_time);
+
 	return 0;
 }
 
